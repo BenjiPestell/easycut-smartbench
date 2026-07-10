@@ -5,6 +5,7 @@ capture points to build up a 2D outline, which can be replayed or exported as an
 
 @author: Benji
 """
+import math
 import os
 import sys
 import time
@@ -374,22 +375,47 @@ class TraceScreenClass(Screen):
     # and https://www.billiam.org/2022/05/30/grbl-smooth-jogging).
     JOYSTICK_JOG_DT = 0.15
 
-    # How many jog commands we allow to be queued (sent but not yet acked) at
-    # once. This is the key lever for hiccups vs responsiveness:
-    #   - 1 (strict wait-for-ack) means GRBL has zero lookahead - the instant
-    #     an ack takes even slightly longer than the segment's execution time,
-    #     the queue runs dry, the machine decelerates to a full stop, and the
-    #     next command has to start from a standstill. That's the "goes fine
-    #     for a while then hiccups a lot" pattern - the log showed ack times
-    #     jump from ~0.01s to a *sustained* ~0.25-0.28s for several seconds
-    #     with the exact same command being resent, i.e. GRBL had nothing
-    #     queued ahead and was pacing acks to its own execution time.
-    #   - A small window (2) keeps one segment always queued ahead, so GRBL
-    #     never runs out of motion to blend into, without flooding it with an
-    #     unbounded backlog (which is what made direction changes laggy
-    #     before). A direction change still flushes the whole window
-    #     immediately via quit_jog() rather than waiting it out.
-    JOYSTICK_MAX_COMMANDS_IN_FLIGHT = 2
+    # Pacing: how much motion (seconds of nominal execution time) to keep
+    # queued in GRBL's planner. CSV telemetry (2026-07-10) showed why pacing
+    # can't be done by counting unacked commands: GRBL acks a $J when it is
+    # *parsed into the planner* (35 slots), not when it executes, so an ack
+    # window simultaneously starves and overfills the planner:
+    #   - starves: with <=2 segments (30mm) queued, GRBL always plans to a
+    #     stop at the end of the queued distance. Measured accel is
+    #     ~105mm/s^2, so holding 6000mm/min needs ~48mm (~0.5s) queued -
+    #     the reported feed sawtoothed between ~3400-4800 exactly as
+    #     v = sqrt(2 * accel * queued_distance) predicts.
+    #   - overfills: acks only reflect parse rate, so when segments execute
+    #     slower than they're sent (diagonals took sqrt(2) longer than
+    #     JOYSTICK_JOG_DT before the unit-vector fix below) the backlog grew
+    #     unbounded - logs showed 27 planner blocks (~5s) of stale motion,
+    #     with one axis still executing the *previous* stick direction.
+    # Instead, each sent segment advances an estimated queue-end time by
+    # JOYSTICK_JOG_DT, and sending pauses while that estimate is more than
+    # this horizon ahead of now. Must comfortably exceed the ~0.5s
+    # decel-limited minimum above (plus jog-loop tick jitter, observed up to
+    # ~0.3s on the Pi); direction changes don't wait the horizon out - they
+    # cancel immediately (see cut-in below).
+    JOYSTICK_QUEUE_HORIZON = 0.7
+
+    # Cut-in: a direction change sharper than ~35 degrees (unit-vector dot
+    # product below this) or a sharp slow-down cancels the current jog
+    # (quit_jog's realtime 0x85 flushes GRBL's whole jog planner queue)
+    # instead of letting the queued horizon play out. The fresh direction is
+    # sent on a *later* tick, once the machine reports the cancel has taken
+    # effect: the serial layer drains the command queue before the realtime
+    # queue on each pass (so cancel+command together can reach GRBL as
+    # [command, cancel]), and GRBL also flushes jog lines that arrive while
+    # the cancel deceleration is still in progress.
+    JOYSTICK_CUT_IN_DOT = 0.82
+    JOYSTICK_CUT_IN_FEED_DROP = 0.5
+    JOYSTICK_CUT_IN_MAX_WAIT = 1.2
+
+    # Safety net against overflowing GRBL's 255-char serial RX buffer if acks
+    # stop arriving entirely (each jog line is ~30 chars). Normal operation
+    # stays well below this: the queue horizon caps outstanding commands at
+    # about horizon/JOG_DT = 5.
+    JOYSTICK_MAX_COMMANDS_IN_FLIGHT = 8
 
     # Safety net: if GRBL stops acking entirely (e.g. a dropped byte), don't
     # get stuck waiting forever - allow sending again after this long
@@ -431,6 +457,10 @@ class TraceScreenClass(Screen):
         self._jog_commands_in_flight = 0
         self._jog_command_last_sent_at = 0
         self._jog_command_sent_times = []  # FIFO of send timestamps, for per-ack latency logging
+        self._jog_queue_end_time = 0  # estimated time the motion queued in GRBL finishes
+        self._last_jog_unit = None  # unit direction of the last sent segment, for cut-in detection
+        self._last_jog_feed = 0
+        self._cut_in_started_at = None  # set while waiting for a cut-in cancel to take effect
 
         # Widgets
         self.xy_move_widget = widget_xy_move_trace.XYMoveTrace(
@@ -562,6 +592,16 @@ class TraceScreenClass(Screen):
     def _log_csv_position(self, *args):
         self.joystick_csv.log_position()
 
+    def _reset_jog_pipeline(self):
+        # Forget everything believed to be queued - used when the queued
+        # motion is being cancelled (stick release, cut-in).
+        self._jog_commands_in_flight = 0
+        self._jog_command_sent_times = []
+        self._jog_queue_end_time = 0
+        self._last_jog_unit = None
+        self._last_jog_feed = 0
+        self._cut_in_started_at = None
+
     def send_joystick_jog_command(self, *args):
         if self.sm.current != self.name:
             return
@@ -583,33 +623,64 @@ class TraceScreenClass(Screen):
             # would also cancel jogs started by holding a direction button.
             if self.joystick_active:
                 self.joystick_active = False
-                self._jog_commands_in_flight = 0
-                self._jog_command_sent_times = []
+                self._reset_jog_pipeline()
                 if self.m.s.m_state.lower() != 'idle':
                     self.m.quit_jog()
                 self.joystick_csv.log_quit()
             return
 
+        # After a cut-in cancel, hold off until the machine has actually
+        # stopped jogging - GRBL silently flushes jog lines that arrive while
+        # the cancel deceleration is still running, so sending sooner just
+        # loses the commands. m_state lags reality slightly (read-side
+        # latency), hence the time cap.
+        if self._cut_in_started_at is not None:
+            if self.m.s.m_state.lower() == 'jog' \
+                    and time.time() - self._cut_in_started_at < self.JOYSTICK_CUT_IN_MAX_WAIT:
+                return
+            self._cut_in_started_at = None
+
+        # Unit direction + magnitude, so a segment's *vector* length (and
+        # therefore its execution time) is the same at every stick angle.
+        # The old per-axis scaling made diagonal segments sqrt(2) longer than
+        # JOYSTICK_JOG_DT, which is what let the planner backlog build up.
+        magnitude = min(1.0, math.hypot(joystick_x, joystick_y))
+        unit_x = joystick_x / magnitude
+        unit_y = joystick_y / magnitude
+
         base_max_feed = self._max_joystick_feed()
         max_feed = base_max_feed / self.joystick_slow_jog_factor \
             if self.joystick_slow_jog_active else base_max_feed
 
-        feedrate = int((abs(joystick_x) + abs(joystick_y)) * max_feed)
-        feedrate = max(min(feedrate, max_feed), 1)
+        feedrate = max(int(magnitude * max_feed), 1)
+
+        # Cut in on a real direction change or a sharp slow-down: flush
+        # GRBL's queued jog motion right away instead of letting up to a
+        # horizon's worth of stale segments play out.
+        if self._last_jog_unit is not None:
+            direction_changed = (unit_x * self._last_jog_unit[0]
+                                 + unit_y * self._last_jog_unit[1]) < self.JOYSTICK_CUT_IN_DOT
+            slowed_sharply = feedrate < self._last_jog_feed * self.JOYSTICK_CUT_IN_FEED_DROP
+            if direction_changed or slowed_sharply:
+                reason = 'direction' if direction_changed else 'feed_drop'
+                if self.JOYSTICK_DEBUG_LOGGING:
+                    Logger.info("Trace app joystick: cut-in ({}), cancelling queued jog".format(reason))
+                self._reset_jog_pipeline()
+                self._cut_in_started_at = time.time()
+                self.m.quit_jog()
+                self.joystick_csv.log_cut_in(reason)
+                return
+
+        # Pacing: send only while the estimated queued motion is under the
+        # horizon. Anchoring the estimate to now also self-heals if GRBL
+        # flushed or rejected anything - the estimate simply drains.
+        now = time.time()
+        queue_end = max(self._jog_queue_end_time, now)
+        if queue_end - now >= self.JOYSTICK_QUEUE_HORIZON:
+            return
 
         if self._jog_commands_in_flight >= self.JOYSTICK_MAX_COMMANDS_IN_FLIGHT:
-            # Window is full - let GRBL work through what's already queued
-            # rather than piling on more. We deliberately do NOT try to cancel
-            # and cut in early on a direction change here: quit_jog() is a
-            # realtime command, but our serial layer drains the whole regular
-            # command queue before the realtime queue on every pass, so a
-            # "cancel, then immediately send the new direction" pair can
-            # actually reach GRBL as [new command, new command, cancel] -
-            # wiping out the fresh command along with the stale one. Instead,
-            # just wait for the next free slot; because it always uses
-            # whatever the stick is doing *then*, a direction change is still
-            # picked up within one short segment, without the race.
-            if time.time() - self._jog_command_last_sent_at > self.JOYSTICK_JOG_ACK_TIMEOUT:
+            if now - self._jog_command_last_sent_at > self.JOYSTICK_JOG_ACK_TIMEOUT:
                 # Safety net: acks seem to have stopped arriving entirely.
                 if self.JOYSTICK_DEBUG_LOGGING:
                     Logger.info("Trace app joystick: ack timeout, resetting in-flight count")
@@ -621,11 +692,15 @@ class TraceScreenClass(Screen):
 
         self.joystick_active = True
 
-        # Distance = speed * time, so each jog command takes about
+        # Distance = speed * time, so each segment's vector takes
         # JOYSTICK_JOG_DT to run when direction/speed stays constant.
         distance = (feedrate / 60.0) * self.JOYSTICK_JOG_DT
-        jog_x_dist = -joystick_x * distance
-        jog_y_dist = -joystick_y * distance
+        jog_x_dist = -unit_x * distance
+        jog_y_dist = -unit_y * distance
+
+        self._jog_queue_end_time = queue_end + self.JOYSTICK_JOG_DT
+        self._last_jog_unit = (unit_x, unit_y)
+        self._last_jog_feed = feedrate
 
         self._jog_commands_in_flight += 1
         self._jog_command_last_sent_at = time.time()

@@ -8,6 +8,8 @@ Writes one row per event to logs/joystick_csv/joystick_YYYYmmdd_HHMMSS.csv
     send    - a $J jog command was written to serial (command text, distances, feed)
     ack     - GRBL responded to a jog command (round-trip latency)
     quit    - stick returned to centre and the jog was cancelled
+    cutin   - direction change / sharp slow-down cancelled the queued jog
+              (reason in the command column)
     timeout - ack timeout hit, in-flight window force-reset
     pos     - GRBL status report changed the machine position
 
@@ -118,6 +120,10 @@ class JoystickCsvLogger(object):
 
     def log_quit(self):
         self._write_row("quit")
+
+    def log_cut_in(self, reason):
+        """A direction-change/slow-down cancel; reason goes in the command column."""
+        self._write_row("cutin", command=reason)
 
     def log_timeout(self, in_flight):
         self._write_row("timeout", in_flight=in_flight)
