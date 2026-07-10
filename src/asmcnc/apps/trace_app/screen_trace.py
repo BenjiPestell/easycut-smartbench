@@ -13,6 +13,7 @@ from kivy.clock import Clock
 from kivy.properties import StringProperty
 
 from asmcnc.apps.trace_app import widget_xy_move_trace, widget_geometry_preview, popup_export_svg
+from asmcnc.apps.trace_app import joystick_csv_logger
 from asmcnc.bluetooth_controller import input_map, popup_pairing, sdl_joystick_hotplug
 from asmcnc.comms.logging_system.logging_system import Logger
 from asmcnc.skavaUI import widget_virtual_bed, widget_status_bar
@@ -361,6 +362,11 @@ class TraceScreenClass(Screen):
     # against real round-trip behaviour. Fairly verbose; turn off once done.
     JOYSTICK_DEBUG_LOGGING = True
 
+    # Set True to record a per-event CSV (stick samples, commands, acks,
+    # position reports) to logs/joystick_csv/ while on this screen, for
+    # offline stutter analysis. See joystick_csv_logger.py for the format.
+    JOYSTICK_CSV_LOGGING = True
+
     # Nominal execution time (seconds) per jog command if it were run in
     # isolation. Each jog's distance is derived from the current feed so it
     # takes roughly this long to run - matching GRBL's own guidance for
@@ -460,6 +466,13 @@ class TraceScreenClass(Screen):
             ],
         )
 
+        # CSV telemetry for offline analysis of jog stutter. Only records
+        # between on_enter/on_leave; the position binding below is a no-op
+        # while the logger is stopped.
+        self.joystick_csv = joystick_csv_logger.JoystickCsvLogger(self.m.s)
+        if self.JOYSTICK_CSV_LOGGING:
+            self.m.s.bind(m_x=self._log_csv_position, m_y=self._log_csv_position)
+
         self.m.s.bind(jog_ack_count=self.on_jog_ack)
         Clock.schedule_interval(self.send_joystick_jog_command, self.JOG_COMMAND_INTERVAL)
 
@@ -476,6 +489,8 @@ class TraceScreenClass(Screen):
         self.joystick_hotplug_poll = Clock.schedule_interval(
             lambda dt: sdl_joystick_hotplug.open_new_joysticks(), self.JOYSTICK_HOTPLUG_POLL_INTERVAL)
         self.input_map.activate()
+        if self.JOYSTICK_CSV_LOGGING:
+            self.joystick_csv.start()
 
     def on_leave(self, *args):
         self.m.laser_off()
@@ -484,6 +499,7 @@ class TraceScreenClass(Screen):
         if self.joystick_hotplug_poll:
             Clock.unschedule(self.joystick_hotplug_poll)
         self.input_map.deactivate()
+        self.joystick_csv.stop()
 
     def update_pulse_opacity(self, dt):
         # Pulse overlay by smoothly alternating between 0 and 1 opacity
@@ -541,13 +557,26 @@ class TraceScreenClass(Screen):
             Logger.info("Trace app joystick: ack received after {}, {} still in flight".format(
                 "{:.3f}s".format(latency) if latency is not None else "?",
                 self._jog_commands_in_flight))
+        self.joystick_csv.log_ack(latency, self._jog_commands_in_flight)
+
+    def _log_csv_position(self, *args):
+        self.joystick_csv.log_position()
 
     def send_joystick_jog_command(self, *args):
         if self.sm.current != self.name:
             return
 
-        joystick_x = self._apply_deadzone(self.input_map.get_axis('jog_x'))
-        joystick_y = self._apply_deadzone(self.input_map.get_axis('jog_y'))
+        raw_x = self.input_map.get_axis('jog_x')
+        raw_y = self.input_map.get_axis('jog_y')
+        joystick_x = self._apply_deadzone(raw_x)
+        joystick_y = self._apply_deadzone(raw_y)
+
+        # Sample the stick every tick while there's anything to see - stick
+        # deflected, jog in progress, or machine still moving - so the CSV has
+        # a continuous timeline through starts, direction changes and stops.
+        if raw_x or raw_y or self.joystick_active or self.m.s.m_state.lower() != 'idle':
+            self.joystick_csv.log_sample(raw_x, raw_y, joystick_x, joystick_y,
+                                         self._jog_commands_in_flight)
 
         if joystick_x == 0 and joystick_y == 0:
             # Only cancel a jog that the joystick itself started - otherwise this
@@ -558,6 +587,7 @@ class TraceScreenClass(Screen):
                 self._jog_command_sent_times = []
                 if self.m.s.m_state.lower() != 'idle':
                     self.m.quit_jog()
+                self.joystick_csv.log_quit()
             return
 
         base_max_feed = self._max_joystick_feed()
@@ -583,6 +613,7 @@ class TraceScreenClass(Screen):
                 # Safety net: acks seem to have stopped arriving entirely.
                 if self.JOYSTICK_DEBUG_LOGGING:
                     Logger.info("Trace app joystick: ack timeout, resetting in-flight count")
+                self.joystick_csv.log_timeout(self._jog_commands_in_flight)
                 self._jog_commands_in_flight = 0
                 self._jog_command_sent_times = []
             else:
@@ -604,6 +635,8 @@ class TraceScreenClass(Screen):
         if self.JOYSTICK_DEBUG_LOGGING:
             Logger.info("Trace app joystick: sending {} (stick=({:.2f}, {:.2f}), {} in flight)".format(
                 jog_command, joystick_x, joystick_y, self._jog_commands_in_flight))
+        self.joystick_csv.log_send(jog_command, joystick_x, joystick_y, feedrate,
+                                   jog_x_dist, jog_y_dist, self._jog_commands_in_flight)
         self.m.s.write_command(jog_command)
 
     # --- Machine actions -----------------------------------------------------

@@ -95,16 +95,16 @@ class PopupInputMapping(Widget):
 
     def rebuild_rows(self):
         self.rows_container.clear_widgets()
-        for action_id, display_name, _default, _callback in self.input_map.actions:
-            self.rows_container.add_widget(self.build_row(
-                display_name,
-                self.input_map.describe_action_binding(action_id),
-                input_map_module.BUTTON, action_id))
         for axis_name, display_name, _default in self.input_map.axes:
             self.rows_container.add_widget(self.build_row(
                 display_name,
                 self.input_map.describe_axis_binding(axis_name),
                 input_map_module.AXIS, axis_name))
+        for action_id, display_name, _default, _callback in self.input_map.actions:
+            self.rows_container.add_widget(self.build_row(
+                display_name,
+                self.input_map.describe_action_binding(action_id),
+                input_map_module.BUTTON, action_id))
 
     def build_row(self, display_name, binding_description, kind, target_id):
         row = BoxLayout(orientation='horizontal', spacing=6, size_hint_y=None, height=44)
